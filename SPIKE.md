@@ -96,7 +96,7 @@ PR #5 added a tone section to `stories/notes.md`, rewrote `players/writer.md` wi
 ### What changes for Mission Control
 
 - Builders run on GitHub Actions with `claude-code-action`, pinned by commit.
-- **Split the builder.** In this spike, the AI step could run tests while holding a write token. In Mission Control, the AI step gets read-only access, and a separate step with no AI publishes the result.
+- **Split the builder.** In this spike, the AI step could run tests while holding a write token. In Mission Control, the AI job gets read-only access, and a separate job on a fresh runner, with no AI, publishes the result.
 - The player's persona goes in as standing instructions. The package is the task.
 - The pull request carries the builder's summary, cost and time.
 - Writing packages say what the scene must do and how it should feel.
