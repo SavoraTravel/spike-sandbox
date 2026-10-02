@@ -1,0 +1,106 @@
+# Spike engine A: run the builder with claude-code-action on GitHub Actions.
+# The AI only edits files. This workflow, not the AI, commits, pushes a work
+# branch and opens the pull request, so the AI never holds push rights.
+name: "Engine A: GitHub Actions builder"
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: Which job to run
+        type: choice
+        options:
+          - code-job
+          - prose-job
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      JOB: ${{ inputs.job }}
+      BRANCH: spike/${{ inputs.job }}-engine-a-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Start a work branch
+        id: base
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git switch -c "$BRANCH"
+
+      - name: Assemble the brief (player + package)
+        id: brief
+        run: |
+          case "$JOB" in
+            code-job) player=players/coder.md ;;
+            prose-job) player=players/writer.md ;;
+          esac
+          {
+            echo 'prompt<<BRIEF_EOF'
+            cat "$player"; echo
+            cat "jobs/$JOB.md"; echo
+            echo '## How to finish'
+            echo 'Edit files only. Do not use git and do not open a pull request: Mission Control commits and publishes your work after you finish.'
+            echo 'BRIEF_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Builder
+        id: claude
+        uses: anthropics/claude-code-action@97c53473391bff1901034d4b454b5bac7ab7a029 # v1.0.239
+        env:
+          CLAUDE_BRANCH: ${{ env.BRANCH }}
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.brief.outputs.prompt }}
+          claude_args: |
+            --model claude-sonnet-5-5
+            --max-turns 30
+            --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm test),Bash(npm test:*),Bash(node --test:*),Bash(ls:*)"
+            --disallowedTools "Bash(git:*),Bash(gh:*),Bash(curl:*)"
+
+      - name: Run the checks
+        id: checks
+        continue-on-error: true
+        run: npm test
+
+      - name: Publish (the workflow pushes and opens the pull request)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXEC_FILE: ${{ steps.claude.outputs.execution_file }}
+          BASE: ${{ steps.base.outputs.sha }}
+          TESTS: ${{ steps.checks.outcome }}
+        run: |
+          git config user.name "Engine A builder"
+          git config user.email "engine-a@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "The builder made no changes."; exit 1; fi
+          git commit -q -m "[Engine A] $JOB"
+          git push origin "$BRANCH"
+
+          stats="$(jq -r '[.[] | select(.type=="result")][-1] | "Cost: $\(.total_cost_usd) · turns: \(.num_turns) · time: \((.duration_ms/1000)|floor)s"' "$EXEC_FILE" 2>/dev/null || echo "Cost: unavailable")"
+          denied="$(jq -r '[.[] | select(.type=="result")][-1].permission_denials // [] | map(.tool_name + " " + ((.tool_input.command // "") | tostring)) | join("; ")' "$EXEC_FILE" 2>/dev/null)"
+          files="$(git diff --name-only "$BASE" HEAD | sed 's/^/- /')"
+          {
+            echo "Built by **Engine A** (GitHub Actions) for \`jobs/$JOB.md\`."
+            echo
+            echo "- $stats"
+            echo "- Tests: $TESTS"
+            echo "- Blocked actions the builder attempted: ${denied:-none}"
+            echo
+            echo "Files changed:"
+            echo "$files"
+            echo
+            echo "Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          } > body.md
+          cat body.md >> "$GITHUB_STEP_SUMMARY"
+          gh pr create --base main --head "$BRANCH" --title "[Engine A] $JOB" --body-file body.md
