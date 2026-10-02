@@ -13,6 +13,13 @@ on:
           - code-job
           - prose-job
         required: true
+      model:
+        description: Which model the builder uses
+        type: choice
+        options:
+          - claude-sonnet-5-5
+          - claude-opus-5-5
+        default: claude-sonnet-5-5
 
 permissions:
   contents: write
@@ -24,6 +31,7 @@ jobs:
     timeout-minutes: 20
     env:
       JOB: ${{ inputs.job }}
+      MODEL: ${{ inputs.model }}
       BRANCH: spike/${{ inputs.job }}-engine-a-${{ github.run_id }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -37,19 +45,27 @@ jobs:
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           git switch -c "$BRANCH"
 
-      - name: Assemble the brief (player + package)
+      - name: Assemble the brief (player as standing instructions, package as the task)
         id: brief
         run: |
           case "$JOB" in
             code-job) player=players/coder.md ;;
             prose-job) player=players/writer.md ;;
           esac
+          # The player file becomes standing (system) instructions. Escape it for the
+          # quoted claude_args value, and drop markdown headings, which claude_args
+          # would otherwise read as comment lines.
+          PLAYER="$player" python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os
+          text = open(os.environ["PLAYER"]).read()
+          text += "\n## How to finish\nEdit files only. Do not use git and do not open a pull request: Mission Control commits and publishes your work after you finish.\n"
+          lines = [l for l in text.splitlines() if not l.lstrip().startswith("#")]
+          esc = "\n".join(lines).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "")
+          print("system<<SYS_EOF"); print(esc); print("SYS_EOF")
+          PY
           {
             echo 'prompt<<BRIEF_EOF'
-            cat "$player"; echo
-            cat "jobs/$JOB.md"; echo
-            echo '## How to finish'
-            echo 'Edit files only. Do not use git and do not open a pull request: Mission Control commits and publishes your work after you finish.'
+            cat "jobs/$JOB.md"
             echo 'BRIEF_EOF'
           } >> "$GITHUB_OUTPUT"
 
@@ -63,7 +79,8 @@ jobs:
           github_token: ${{ github.token }}
           prompt: ${{ steps.brief.outputs.prompt }}
           claude_args: |
-            --model claude-sonnet-5-5
+            --model ${{ inputs.model }}
+            --append-system-prompt "${{ steps.brief.outputs.system }}"
             --max-turns 30
             --allowedTools "Read,Edit,Write,Glob,Grep,Bash(npm test),Bash(npm test:*),Bash(node --test:*),Bash(ls:*)"
             --disallowedTools "Bash(git:*),Bash(gh:*),Bash(curl:*)"
@@ -84,14 +101,15 @@ jobs:
           git config user.email "engine-a@users.noreply.github.com"
           git add -A
           if git diff --cached --quiet; then echo "The builder made no changes."; exit 1; fi
-          git commit -q -m "[Engine A] $JOB"
+          git commit -q -m "[Engine A] $JOB ($MODEL)"
           git push origin "$BRANCH"
 
           stats="$(jq -r '[.[] | select(.type=="result")][-1] | "Cost: $\(.total_cost_usd) · turns: \(.num_turns) · time: \((.duration_ms/1000)|floor)s"' "$EXEC_FILE" 2>/dev/null || echo "Cost: unavailable")"
+          summary="$(jq -r '[.[] | select(.type=="result")][-1].result // "(no summary)"' "$EXEC_FILE" 2>/dev/null)"
           denied="$(jq -r '[.[] | select(.type=="result")][-1].permission_denials // [] | map(.tool_name + " " + ((.tool_input.command // "") | tostring)) | join("; ")' "$EXEC_FILE" 2>/dev/null)"
           files="$(git diff --name-only "$BASE" HEAD | sed 's/^/- /')"
           {
-            echo "Built by **Engine A** (GitHub Actions) for \`jobs/$JOB.md\`."
+            echo "Built by **Engine A** (GitHub Actions) for \`jobs/$JOB.md\`, model \`$MODEL\`."
             echo
             echo "- $stats"
             echo "- Tests: $TESTS"
@@ -100,7 +118,11 @@ jobs:
             echo "Files changed:"
             echo "$files"
             echo
+            echo "Builder's summary:"
+            echo
+            echo "$summary" | sed 's/^/> /'
+            echo
             echo "Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           } > body.md
           cat body.md >> "$GITHUB_STEP_SUMMARY"
-          gh pr create --base main --head "$BRANCH" --title "[Engine A] $JOB" --body-file body.md
+          gh pr create --base main --head "$BRANCH" --title "[Engine A] $JOB · $MODEL" --body-file body.md
