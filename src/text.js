@@ -14,3 +14,9 @@ export function truncate(text, max) {
   if (s.length <= max) return s;
   return s.slice(0, Math.max(0, max - 1)).trimEnd() + "…";
 }
+
+export function countWords(sentence) {
+  return String(sentence)
+    .split(" ")
+    .filter((word) => word !== "").length;
+}
